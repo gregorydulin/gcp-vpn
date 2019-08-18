@@ -1,0 +1,44 @@
+# It's pretty safe to change these variables
+
+## friendly project name
+project_name: "gcp-vpn"
+
+## Always Free is only available in us-east1 , us-west1 , and us-central1 regions (2019-12-06)
+zone: "us-central1-a"
+
+## high-numbered port derived from project_id
+vpn_port: "{{ 65535 | random(start=32767,seed=project_id) }}"
+
+## A separate .ovpn file will be generated for each client
+client_friendly_names:
+  - "alice"
+  - "bob"
+
+## change this to get a different project ID suffix
+project_id_seed: ""
+
+
+
+# Don't change these variables unless you know what you're doing
+
+## ensures our Project ID is unique across all of GCP
+project_id_long: >-
+  {{ project_name
+     + '-' 
+     + (
+         hostvars["localhost"].active_account
+         + project_id_seed
+       ) | hash('sha512')
+  }}
+project_id: "{{ project_id_long[:30] }}"
+
+service_account_file: "{{ playbook_dir }}/temporary_keys.json"
+auth_kind: serviceaccount
+env:
+  CLOUDSDK_CORE_PROJECT: "{{ project_id }}"
+destroy: "{{ cli_destroy | default(false) }}"
+state: >-
+  {{ "absent" if destroy == "true" else "present" }}
+instance_public_ip: >-
+  {{ hostvars.localhost.instance.networkInterfaces[0].accessConfigs[0].natIP }}
+

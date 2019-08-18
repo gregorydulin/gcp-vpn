@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+
+install_gcloud() {
+  # https://cloud.google.com/sdk/docs/downloads-apt-get
+  sudo touch /etc/apt/sources.list.d/google-cloud-sdk.list
+  grep 'cloud-sdk' /etc/apt/sources.list.d/google-cloud-sdk.list ||
+    echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" |
+      sudo tee -a /etc/apt/sources.list.d/google-cloud-sdk.list
+  
+  sudo apt-get -y install apt-transport-https ca-certificates
+  
+  curl https://packages.cloud.google.com/apt/doc/apt-key.gpg |
+    sudo apt-key --keyring /usr/share/keyrings/cloud.google.gpg add -
+  
+  sudo apt-get -y update && sudo apt-get -y install google-cloud-sdk
+}
+
+configure_virtualenv() {
+  sudo apt-get -y install \
+    build-essential \
+    libssl-dev \
+    libffi-dev \
+    python3-dev \
+    python3-venv \
+    python3-pip \
+
+  python3 -m venv env
+  source env/bin/activate
+  failcount=0
+  until (
+    pip3 install \
+      wheel \
+      requests \
+      google-auth \
+      ansible \
+      jmespath \
+  ); do
+    ${failcount}++
+    if [[ ${failcount} -gt 3 ]]; then
+      echo "pip3 install failed too many times" >&2
+      exit 1
+    fi
+    echo "Trying again..."
+    sleep 2
+  done
+  # TODO: see about getting whatever changes I made merged into kyl191.openvpn
+  # ansible-galaxy install kyl191.openvpn --force
+  ansible-galaxy install gregorydulin.ansible_role_openvpn --force
+}
+
+gcp_login() {
+  if [ "$(gcloud auth list --format=json)" == "[]" ]; then
+    was_logged_in=false
+    gcloud auth login
+  fi
+}
+
+gcp_logout() {
+  if [ "$was_logged_in" == "false" ]; then
+    gcloud auth revoke
+  fi
+}
+
+help_message() {
+  cat - << 'EOF'
+  -h --help               Print this help message
+  -v --verbose --debug    debug output
+  -d --destroy            destroy GCP resources
+EOF
+  exit 0
+}
+
+parse_args() {
+  # https://stackoverflow.com/a/14203146/2895343
+  POSITIONAL=()
+  ansible_args=()
+  while [[ $# -gt 0 ]]
+  do
+  key="$1"
+
+  case $key in
+      -h|--help)
+        help_message
+        shift # past argument
+        ;;
+      -v|--verbose|--debug)
+        DEBUG="true"
+        export DEBUG
+        ansible_args+=( "-vvv" )
+        shift # past argument
+        ;;
+      -d|--destroy)
+        ansible_args+=( "--extra-vars" "cli_destroy=true" )
+        shift # past argument
+        ;;
+      *)    # unknown option
+        POSITIONAL+=("$1") # save it in an array for later
+        shift # past argument
+        ;;
+  esac
+  done
+  set -- "${POSITIONAL[@]}" # restore positional parameters
+}
+
+main() {
+  set -e
+  parse_args "$@"
+  if [ "$DEBUG" == "true" ]; then
+    set -x
+  fi
+  install_gcloud
+  configure_virtualenv
+  gcp_login
+    ansible-playbook gcp-vpn.yaml "${ansible_args[@]}"
+  gcp_logout
+}
+
+main "$@"

@@ -1,0 +1,322 @@
+---
+
+- name: "OpenVPN server in GCP"
+  hosts: localhost
+
+  tasks:
+
+    - name: "Fetch list of authorized accounts"
+      shell: |
+        gcloud auth list \
+          --format=json
+      register: credentialed_accounts
+      until: >-
+        'ACTIVE' in credentialed_accounts.stdout
+      retries: 10
+      delay: 1
+
+    - name: "Set active_account fact"
+      set_fact:
+        active_account: >-
+          {{ credentialed_accounts.stdout 
+             | from_json 
+             | json_query( "[? status == 'ACTIVE' ] | [0].account" )
+          }}
+
+    - name: "Create project"
+      shell: |
+        gcloud projects create \
+          {{ project_id | quote }} \
+          --name={{ project_name | quote }}
+      register: result
+      failed_when: >-
+        result.rc != 0
+        and 'The project ID you specified is already in use' not in result.stderr
+      changed_when: >-
+        'The project ID you specified is already in use' not in result.stderr
+
+    - name: "Update project name"
+      shell: |
+        gcloud projects update \
+          {{ project_id | quote }} \
+          --name={{ project_name | quote }}
+      register: result
+
+    - name: "Make project our active project"
+      shell: |
+        gcloud config set project {{ project_id | quote }}
+
+    - name: "Fetch list of billing accounts"
+      shell: |
+        gcloud beta billing accounts list \
+          --format=json
+      register: billing_accounts
+
+    - name: "Set my_billing_account fact"
+      set_fact:
+        my_billing_account: >-
+          {{ billing_accounts.stdout
+             | from_json
+             | json_query (
+                 "[? displayName == 'My Billing Account' ] | [0].name"
+               )
+             | regex_replace ( '^billingAccounts/' , '' )
+          }}
+
+    - name: "Enable billing on our project"
+      shell: |
+        gcloud beta billing projects link \
+          {{ project_id | quote }} \
+          --billing-account {{ my_billing_account | quote }}
+
+    - name: "Add roles to our active account"
+      with_items:
+        - roles/compute.osAdminLogin
+        - roles/iam.serviceAccountUser
+      shell: |
+        gcloud projects add-iam-policy-binding {{ project_id | quote }} \
+          --member user:{{ active_account | quote }} \
+          --role {{ item | quote }}
+
+    - name: "Tasks which need CLOUDSDK_CORE_PROJECT set"
+      environment: "{{ env }}"
+      block:
+
+        - name: "Enable GCP APIs"
+          with_items:
+            - compute.googleapis.com
+          shell: |
+            gcloud services enable {{ item | quote }}
+
+        - name: "Enable OS Login"
+          shell: |
+            gcloud compute project-info add-metadata --metadata enable-oslogin=TRUE
+
+        - name: "Fetch list of service accounts"
+          shell: |
+            gcloud iam service-accounts list \
+              --format=json \
+          register: service_account
+
+        - name: "Set service_account fact"
+          set_fact:
+            service_account: >-
+              {{ service_account.stdout
+                 | from_json
+                 | json_query(
+                     "[? contains (
+                           name, 
+                           '" + project_id + "'
+                         ) 
+                      ] 
+                      | [? displayName == 'Compute Engine default service account' ]
+                      | [0]"
+                   )
+              }}
+
+        - name: "Generate keys for service_account"
+          shell: |
+            gcloud iam service-accounts keys create \
+              {{ service_account_file | quote }} \
+              --iam-account={{ service_account.email | quote }}
+          register: service_account_key
+
+        - name: "Set service_account_key_id fact"
+          set_fact:
+            service_account_key_id: >-
+              {{ service_account_key.stderr
+                 | regex_replace ( 'created key \[([0-9a-f]*)\].*' , '\1' )
+              }}
+
+        - name: "Configure local ssh settings for GCP"
+          shell: |
+            gcloud compute config-ssh
+
+        - name: "Attach ssh key to google account for 1 hour"
+          shell: |
+            gcloud compute os-login ssh-keys add \
+              --key-file ~/.ssh/google_compute_engine.pub \
+              --ttl 1h
+
+        - name: "Create instance"
+          gcp_compute_instance:
+            auth_kind: "{{ auth_kind }}"
+            can_ip_forward: yes
+            disks:
+              - auto_delete: yes
+                boot: yes
+                initialize_params:
+                  disk_size_gb: 10
+                  disk_type: "pd-standard"
+                  source_image: 
+                    "projects/gce-uefi-images/global/images/family/ubuntu-1804-lts"
+            machine_type: "f1-micro"
+            metadata:
+              enable-oslogin: "TRUE"
+              block-project-ssh-keys: "FALSE"
+            name: "{{ project_name }}-host"
+            network_interfaces:
+              - access_configs:
+                  - name: "External NAT"
+                    type: "ONE_TO_ONE_NAT"
+            project: "{{ project_id }}"
+            scheduling:
+              automatic_restart: yes
+            service_account_file: "{{ service_account_file }}"
+            state: "{{ state }}"
+            zone: "{{ zone }}"
+          register: instance
+
+        - name: "Refresh local ssh settings for GCP"
+          shell: |
+            gcloud compute config-ssh
+
+        - name: "Create GCP firewall rule to allow incoming traffic on VPN port"
+          with_items:
+            - create
+            - update
+          shell: |
+            gcloud compute firewall-rules {{ item }} default-vpn \
+              {{ '--action allow' if item == 'create' else '' }} \
+              --source-ranges "0.0.0.0/0" \
+              --rules udp:{{ vpn_port }}
+          register: result
+          changed_when: >-
+            'already exists' not in result.stderr
+          failed_when: >-
+            'already exists' not in result.stderr
+            and result.rc != 0
+
+        - name: "Fetch POSIX username"
+          shell: |
+            gcloud compute os-login describe-profile \
+              --format=json
+          register: describe_profile
+
+        - name: "Set posix_username fact"
+          set_fact:
+            posix_username: >-
+              {{ describe_profile.stdout |
+                 from_json |
+                 json_query (
+                   "posixAccounts[0].username"
+                 )
+              }}
+
+        - name: "Add host to hostgroup"
+          when: "(destroy | bool) == false"
+          add_host:
+            hostname: "{{ instance.name }}.{{ zone }}.{{ project_id }}"
+            groupname: "gcp_vpn"
+            ansible_ssh_extra_args: >-
+              -o StrictHostKeyChecking=no
+              -o UserKnownHostsFile=/dev/null
+            ansible_user: "{{ posix_username }}"
+
+        - name: "Wait for SSH to come up"
+          when: "(destroy | bool) == false"
+          shell: |
+            ssh \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              {{ posix_username }}@{{ instance.name }}.{{ zone }}.{{ project_id }} \
+          register: result
+          until: result is success
+          retries: 10
+          delay: 10
+
+      always:
+
+        - name: "Revoke service_account key"
+          shell: |
+            gcloud iam service-accounts keys delete \
+              {{ service_account_key_id | quote }} \
+              --iam-account={{ service_account.email | quote }} \
+              --quiet \
+
+        - name: "Delete service_account key file"
+          file:
+            path: "{{ service_account_file }}"
+            state: absent
+
+- name: "Tasks for new host"
+  hosts: "gcp_vpn"
+  tasks:
+
+    - name: "If vpn_port is 53, we need to disable systemd-resolve"
+      when: "(vpn_port | int) == 53"
+      block:
+
+        - name: "If vpn_port is 53, write static /etc/resolv.conf so we can steal :53 from systemd-resolve"
+          become: true
+          copy:
+            mode: "u=rw,g=r,o=r"
+            content: |
+              nameserver 169.254.169.254
+              search us-central1-a.c.gcp-vpn-c0fbb078bb91edd242436b.internal c.gcp-vpn-c0fbb078bb91edd242436b.internal google.internal
+            dest: /etc/resolv.conf
+
+        - name: "If vpn_port is 53, disable systemd-resolve DNS Stub Listener in conf"
+          become: true
+          lineinfile:
+            path: /etc/systemd/resolved.conf
+            line: "DNSStubListener=no"
+            regexp: '^DNSStubListener='
+
+        - name: "If vpn_port is 53, stop systemd-resolved.service"
+          become: true
+          systemd:
+            name: "systemd-resolved"
+            state: stopped
+            enabled: false
+
+    - name: "Configure OpenVPN server"
+      vars:
+        openvpn_port: "{{ vpn_port }}"
+        openvpn_compression: "lzo"
+        openvpn_server_hostname: "{{ instance_public_ip }}"
+        openvpn_resolv_retry: "infinite"
+        openvpn_client_to_client: true
+        openvpn_fetch_config_dir: "{{ playbook_dir }}/client-config"
+        openvpn_dualstack: false
+        clients: "{{ client_friendly_names }}"
+      become: true
+      import_role:
+        name: "gregorydulin.ansible_role_openvpn"
+
+- name: "Write client files to GCP Storage"
+  hosts: localhost
+  tasks:
+
+    - name: "Create bucket for client files"
+      when: "(destroy | bool) == false"
+      shell: |
+        gsutil mb -l us-central1 gs://{{ project_id | quote }}
+      register: result
+      changed_when: >-
+        'already exists' not in result.stderr
+      failed_when: >-
+        'already exists' not in result.stderr
+        and result.rc != 0
+
+    - name: "Delete bucket for client files"
+      when: "(destroy | bool) == true"
+      shell: |
+        gsutil rm -r gs://{{ project_id | quote }}
+      register: result
+      changed_when: >-
+        result.rc == 0
+      failed_when: >-
+        'bucket does not exist' not in result.stderr
+        and result.rc != 0
+
+    - name: "Write files to bucket"
+      when: "(destroy | bool) == false"
+      shell: |
+        gsutil rsync -d -r {{ playbook_dir | quote }}/client-config gs://{{ project_id | quote }}/client-config
+
+    - name: "Remove local client-config folder"
+      file:
+        path: "{{ playbook_dir }}/client-config"
+        state: "absent"
+
