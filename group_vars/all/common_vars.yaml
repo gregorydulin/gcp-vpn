@@ -32,7 +32,8 @@ project_name: "gcp-vpn"
 zone: "us-central1-a"
 
 ## high-numbered port derived from project_id
-vpn_port: "{{ 65535 | random(start=32767,seed=project_id) }}"
+#vpn_port: "{{ 65535 | random(start=32767,seed=project_id) }}"
+vpn_port: "53"
 
 ## A separate .ovpn file will be generated for each client
 client_friendly_names:
@@ -40,7 +41,8 @@ client_friendly_names:
   - "bob"
 
 ## change this to get a different project ID suffix
-project_id_seed: ""
+#project_id_seed: ""
+project_id_seed: "3"
 
 
 
