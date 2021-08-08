@@ -150,7 +150,7 @@
                   disk_type: "pd-standard"
                   source_image: 
                     "projects/gce-uefi-images/global/images/family/ubuntu-1804-lts"
-            machine_type: "f1-micro"
+            machine_type: "e2-micro"
             metadata:
               enable-oslogin: "TRUE"
               block-project-ssh-keys: "FALSE"
